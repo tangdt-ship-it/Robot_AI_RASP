@@ -1,0 +1,70 @@
+system:
+  name: ROBOT
+  locale: vi-VN
+  fail_closed: true
+  data_dir: /var/lib/robot-ai
+
+wakeword:
+  enabled: true
+  phrase: ROBOT
+  backend: sherpa_onnx
+  sample_rate: 16000
+  threshold: 0.25
+  score: 2.0
+  cooldown_s: 1.5
+  model_dir: /opt/robot-ai/models/kws-gigaspeech
+  keyword_tokens: "R OW1 B AA2 T @ROBOT"
+
+robotlink:
+  device: /dev/ttyAMA0
+  baudrate: 115200
+  command_timeout_s: 2.0
+  motion_timeout_s: 30.0
+  heartbeat_s: 0.5
+  stale_state_s: 1.5
+
+hardware:
+  audio:
+    input_device: default
+    output_device: default
+    input_sample_rate: 16000
+    output_sample_rate: 48000
+    xiaozhi_output_sample_rate: 24000
+  tft:
+    enabled: true
+    width: 240
+    height: 240
+    spi_bus: 0
+    spi_device: 0
+    spi_hz: 40000000
+    gpio_dc: 25
+    gpio_reset: 24
+    gpio_backlight: 23
+  uart:
+    tx_gpio: 14
+    rx_gpio: 15
+  i2s:
+    bclk_gpio: 18
+    lrclk_gpio: 19
+    mic_data_gpio: 20
+    speaker_data_gpio: 21
+  camera:
+    enabled: true
+    backend: libcamera
+
+safety:
+  require_robotlink: true
+  require_owner: true
+  require_sensor_health: true
+  require_encoder_health: true
+  require_odometry_health: true
+  automatic_detour: false
+  automatic_reverse: false
+  automatic_resume_after_ai: false
+
+xiaozhi:
+  engine: py-xiaozhi
+  upstream_repo: https://github.com/huangjunsen0406/py-xiaozhi.git
+  upstream_commit: 577e1c9802a899ee558e6fa4f6fed8c4c64cecee
+  mode: cli
+  protocol: websocket
