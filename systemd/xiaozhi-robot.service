@@ -1,0 +1,22 @@
+[Unit]
+Description=Xiaozhi Voice AI for Robot_AI Raspberry Pi
+After=network-online.target sound.target robot-ai.service
+Wants=network-online.target
+Requires=robot-ai.service
+
+[Service]
+Type=simple
+User=robotai
+Group=robotai
+SupplementaryGroups=audio video gpio spi
+WorkingDirectory=/opt/robot-ai/vendor/py-xiaozhi
+Environment=ROBOT_AI_SOCKET=/run/robot-ai/robotd.sock
+Environment=XIAOZHI_DATA_DIR=/var/lib/robot-ai/xiaozhi
+ExecStart=/opt/robot-ai/venv/bin/python /opt/robot-ai/vendor/py-xiaozhi/main.py --mode cli --protocol websocket
+Restart=on-failure
+RestartSec=2
+MemoryHigh=320M
+MemoryMax=400M
+
+[Install]
+WantedBy=multi-user.target

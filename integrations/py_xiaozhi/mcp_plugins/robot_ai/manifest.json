@@ -1,0 +1,8 @@
+{
+  "id": "robot_ai",
+  "api_version": 1,
+  "entry": "plugin:register",
+  "runtime": "python-inprocess",
+  "enabled_by_default": true,
+  "platforms": ["linux-arm64", "linux-armv7l"]
+}

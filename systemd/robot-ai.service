@@ -1,0 +1,26 @@
+[Unit]
+Description=Robot_AI Raspberry Pi motion/safety gateway
+After=dev-ttyAMA0.device
+Wants=dev-ttyAMA0.device
+
+[Service]
+Type=simple
+User=robotai
+Group=robotai
+SupplementaryGroups=dialout gpio spi audio video
+RuntimeDirectory=robot-ai
+RuntimeDirectoryMode=0770
+StateDirectory=robot-ai
+ExecStart=/opt/robot-ai/venv/bin/robot-ai --config /etc/robot-ai/robot.yaml daemon
+Restart=on-failure
+RestartSec=1
+TimeoutStopSec=5
+KillSignal=SIGINT
+OOMScoreAdjust=-500
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/robot-ai /run/robot-ai
+
+[Install]
+WantedBy=multi-user.target
