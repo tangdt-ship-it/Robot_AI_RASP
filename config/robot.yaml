@@ -20,7 +20,7 @@ robotlink:
   baudrate: 115200
   command_timeout_s: 2.0
   motion_timeout_s: 30.0
-  heartbeat_s: 0.5
+  heartbeat_s: 0.2
   stale_state_s: 1.5
 
 hardware:
