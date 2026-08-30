@@ -12,9 +12,25 @@ import serial_asyncio
 
 from ..blackbox import SafetyBlackBox
 from ..config import RobotLinkConfig
-from .frame import InboundFrame, encode_command, key_values, parse_inbound
-from .models import DistanceCode, DistanceResult, FusionStatus, ImuStatus, ObstacleStatus, Odometry, RobotState, TurnResult
-from .parsers import parse_encoder, parse_fusion, parse_imu, parse_obstacle, parse_odometry, parse_state
+from .frame import InboundFrame, encode_command, parse_inbound
+from .models import (
+    DistanceCode,
+    DistanceResult,
+    FusionStatus,
+    ImuStatus,
+    ObstacleStatus,
+    Odometry,
+    RobotState,
+    TurnResult,
+)
+from .parsers import (
+    parse_encoder,
+    parse_fusion,
+    parse_imu,
+    parse_obstacle,
+    parse_odometry,
+    parse_state,
+)
 
 LOG = logging.getLogger(__name__)
 Predicate = Callable[[InboundFrame], bool]
@@ -41,8 +57,16 @@ def _nonzero_u32() -> int:
     return value
 
 
+def _field_after(frame: InboundFrame, label: str, default: str = "") -> str:
+    target = label.upper()
+    for index, field in enumerate(frame.fields[:-1]):
+        if field.upper() == target:
+            return frame.fields[index + 1]
+    return default
+
+
 class RobotLinkClient:
-    """Async RobotLink V3 transport preserving the ESP32 safety/correlation contract."""
+    """Async RobotLink V3 client preserving the ESP32 fail-closed contract."""
 
     def __init__(self, config: RobotLinkConfig, blackbox: SafetyBlackBox | None = None):
         self.config = config
@@ -51,6 +75,7 @@ class RobotLinkClient:
         self._writer = None
         self._rx_task: asyncio.Task | None = None
         self._heartbeat_task: asyncio.Task | None = None
+        self._recovery_task: asyncio.Task | None = None
         self._transaction_lock = asyncio.Lock()
         self._tx_lock = asyncio.Lock()
         self._motion_lock = asyncio.Lock()
@@ -59,6 +84,7 @@ class RobotLinkClient:
         self._last_rx = 0.0
         self._protocol_compatible = False
         self._motion_lease = False
+        self._active_motion_type = ""
         self._stop_in_progress = False
         self._ps2_override = False
         self._session_id = _nonzero_u32()
@@ -98,12 +124,14 @@ class RobotLinkClient:
         )
         self._rx_task = asyncio.create_task(self._reader_loop(), name="robotlink-rx")
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(), name="robotlink-heartbeat")
+        self._recovery_task = asyncio.create_task(self._recovery_loop(), name="robotlink-recovery")
 
     async def close(self) -> None:
-        for task in (self._heartbeat_task, self._rx_task):
+        tasks = (self._recovery_task, self._heartbeat_task, self._rx_task)
+        for task in tasks:
             if task:
                 task.cancel()
-        for task in (self._heartbeat_task, self._rx_task):
+        for task in tasks:
             if task:
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
@@ -156,6 +184,7 @@ class RobotLinkClient:
         if frame.kind == "BOOT" and frame.has("STM32"):
             self.blackbox.record("LINK_LOSS", *(self._active_pair or (0, 0)), detail="STM32_BOOT")
             self._invalidate_session("STM32_BOOT")
+            self._motion_cancel_event.set()
             self._fail_waiters(RobotLinkError("STM32 rebooted"))
             return
         if frame.kind == "EVENT":
@@ -184,22 +213,25 @@ class RobotLinkClient:
 
     def _handle_event(self, frame: InboundFrame) -> None:
         text = ",".join(frame.fields).upper()
+        pair = self._active_pair or (0, 0)
         if text == "EVENT,AI_CANCELLED,PS2_OVERRIDE":
             self._ps2_override = True
             self._motion_lease = False
             self._motion_cancel_event.set()
-            self.blackbox.record("PS2_OVERRIDE", *(self._active_pair or (0, 0)))
+            self.blackbox.record("PS2_OVERRIDE", *pair)
         elif text == "EVENT,STOP,MOTION_LEASE_TIMEOUT":
             self._motion_lease = False
             self._motion_cancel_event.set()
-            self.blackbox.record("LEASE_TIMEOUT", *(self._active_pair or (0, 0)))
+            self.blackbox.record("LEASE_TIMEOUT", *pair)
         elif text.startswith("EVENT,ENCODER,FAULT"):
             self._motion_lease = False
             self._motion_cancel_event.set()
-            self.blackbox.record("ENCODER_FAULT", *(self._active_pair or (0, 0)))
+            self.blackbox.record("ENCODER_FAULT", *pair)
         elif text.startswith("EVENT,OBSTACLE,STOPPED"):
-            self._motion_lease = False
-            self.blackbox.record("OBSTACLE_STOPPED", *(self._active_pair or (0, 0)))
+            # ESP32 keeps the heartbeat alive during an avoidance TURN.
+            if self._active_motion_type != "TURN":
+                self._motion_lease = False
+            self.blackbox.record("OBSTACLE_STOPPED", *pair)
 
     def _fail_waiters(self, exc: Exception) -> None:
         for waiter in tuple(self._waiters):
@@ -207,12 +239,16 @@ class RobotLinkClient:
                 waiter.future.set_exception(exc)
         self._waiters.clear()
 
-    def _invalidate_session(self, reason: str) -> None:
+    def _invalidate_motion(self, reason: str) -> None:
         if self._active_pair:
             self.blackbox.record("SESSION_CHANGE", *self._active_pair, detail=reason)
         self._active_pair = None
         self._terminal_operation_id = 0
+        self._active_motion_type = ""
         self._motion_lease = False
+
+    def _invalidate_session(self, reason: str) -> None:
+        self._invalidate_motion(reason)
         self._protocol_compatible = False
 
     async def _send(self, body: str) -> None:
@@ -241,14 +277,27 @@ class RobotLinkClient:
             with contextlib.suppress(ValueError):
                 self._waiters.remove(waiter)
 
-    async def _request(self, body: str, accept: Predicate, timeout: float | None = None) -> InboundFrame:
+    async def _request(
+        self,
+        body: str,
+        accept: Predicate,
+        timeout: float | None = None,
+        *,
+        generic_errors: bool = True,
+    ) -> InboundFrame:
         timeout = timeout or self.config.command_timeout_s
+
+        def response(frame: InboundFrame) -> bool:
+            if accept(frame):
+                return True
+            return generic_errors and frame.kind in {"NACK", "ERR"}
+
         async with self._transaction_lock:
-            waiter = asyncio.create_task(self._wait_for(lambda f: accept(f) or f.kind in {"NACK", "ERR"}, timeout))
-            await asyncio.sleep(0)
+            waiter = asyncio.create_task(self._wait_for(response, timeout))
+            await asyncio.sleep(0)  # install waiter before bytes leave the UART
             await self._send(body)
             frame = await waiter
-            if frame.kind in {"NACK", "ERR"} and not accept(frame):
+            if generic_errors and frame.kind in {"NACK", "ERR"} and not accept(frame):
                 raise RobotLinkError(frame.raw)
             return frame
 
@@ -271,6 +320,20 @@ class RobotLinkClient:
         self.blackbox.record("SESSION_CHANGE", self._session_id, 0, "HELLO")
         return True
 
+    async def _recovery_loop(self) -> None:
+        await asyncio.sleep(0.8)
+        while True:
+            if (
+                self._writer is not None
+                and not self._protocol_compatible
+                and not self._motion_lease
+                and self._active_pair is None
+                and not self._stop_in_progress
+            ):
+                with contextlib.suppress(RobotLinkError, RobotLinkTimeout, OSError):
+                    await self.negotiate(0.7)
+            await asyncio.sleep(0.75)
+
     async def set_mode(self, ai_mode: bool, timeout: float = 0.7) -> bool:
         if ai_mode and not self._protocol_compatible:
             await self.negotiate(timeout)
@@ -286,9 +349,11 @@ class RobotLinkClient:
         self._motion_lease = False
         active = self._active_pair or (0, 0)
         self.blackbox.record("STOP", *active, detail="STOP")
-        self._invalidate_session("STOP")
+        # STOP is not a HELLO/PING session boundary on the ESP32 implementation.
+        self._invalidate_motion("STOP")
         try:
             await self._request("STOP", lambda f: f.kind == "DONE" and f.has("STOP"), timeout)
+            # Finite waiters are released only after physical DONE,STOP confirmation.
             self._motion_cancel_event.set()
             return True
         finally:
@@ -327,6 +392,26 @@ class RobotLinkClient:
             raise RobotLinkError(frame.raw)
         return frame.fields[2]
 
+    async def get_heading(self, timeout: float = 0.7) -> float:
+        return float(await self.get_value("HEADING", timeout))
+
+    async def get_speed(self, timeout: float = 0.7) -> int:
+        return int(await self.get_value("SPEED", timeout))
+
+    async def get_brake(self, timeout: float = 0.7) -> bool:
+        return (await self.get_value("BRAKE", timeout)).upper() == "ON"
+
+    async def get_ramp(self, timeout: float = 0.7) -> bool:
+        return (await self.get_value("RAMP", timeout)).upper() == "ON"
+
+    async def get_compass_status(self, timeout: float = 0.7) -> dict[str, str]:
+        frame = await self._request("GET,COMPASS_STATUS", lambda f: f.kind == "VALUE" and f.has("COMPASS"), timeout)
+        return {frame.fields[i].upper(): frame.fields[i + 1] for i in range(2, len(frame.fields) - 1, 2)}
+
+    async def get_ps2_status(self, timeout: float = 0.7) -> dict[str, str]:
+        frame = await self._request("PS2,STATUS", lambda f: f.kind == "PS2" and f.has("STATE"), timeout)
+        return {frame.fields[i].upper(): frame.fields[i + 1] for i in range(1, len(frame.fields) - 1, 2)}
+
     async def set_speed(self, speed: int, timeout: float = 0.7) -> bool:
         if not 10 <= speed <= 255:
             raise ValueError("speed must be 10..255")
@@ -349,19 +434,60 @@ class RobotLinkClient:
         await self._request("ENCODER,RESET", lambda f: f.kind == "ACK", timeout)
         return True
 
-    def _begin_pair(self) -> tuple[int, int]:
+    @staticmethod
+    def _clamp_motion_speed(speed: int) -> int:
+        return max(10, min(int(speed), 20))
+
+    async def move_forward(self, speed: int = 20, timeout: float = 0.7) -> bool:
+        await self._request(f"CMD,FWD,{self._clamp_motion_speed(speed)}", lambda f: f.kind == "ACK", timeout)
+        return True
+
+    async def move_backward(self, speed: int = 20, timeout: float = 0.7) -> bool:
+        await self._request(f"CMD,BACK,{self._clamp_motion_speed(speed)}", lambda f: f.kind == "ACK", timeout)
+        return True
+
+    async def turn_left(self, speed: int = 20, timeout: float = 0.7) -> bool:
+        await self._request(f"CMD,LEFT,{self._clamp_motion_speed(speed)}", lambda f: f.kind == "ACK", timeout)
+        return True
+
+    async def turn_right(self, speed: int = 20, timeout: float = 0.7) -> bool:
+        await self._request(f"CMD,RIGHT,{self._clamp_motion_speed(speed)}", lambda f: f.kind == "ACK", timeout)
+        return True
+
+    async def start_continuous(self, forward: bool, speed: int = 20, timeout: float = 0.7) -> bool:
+        command = f"MOVE,{'FWD' if forward else 'BACK'},{self._clamp_motion_speed(speed)},CONT"
+        await self._request(command, lambda f: f.kind == "ACK", timeout)
+        self._active_motion_type = "MOVE"
+        self._motion_lease = True
+        return True
+
+    async def start_continuous_rotation(self, left: bool, speed: int = 20, timeout: float = 0.7) -> bool:
+        command = f"MOVE,{'LEFT' if left else 'RIGHT'},{self._clamp_motion_speed(speed)},CONT"
+        await self._request(command, lambda f: f.kind == "ACK", timeout)
+        self._active_motion_type = "TURN"
+        self._motion_lease = True
+        return True
+
+    def _begin_pair(self, motion_type: str) -> tuple[int, int]:
         if not self.session_ready() or self._active_pair is not None:
             raise RobotLinkError("motion session not ready")
         op = self._next_operation_id
         self._next_operation_id = (self._next_operation_id + 1) & 0xFFFFFFFF or 1
         self._active_pair = (self._session_id, op)
         self._terminal_operation_id = 0
+        self._active_motion_type = motion_type
         self._motion_cancel_event.clear()
         self.blackbox.record("COMMAND_SEND", self._session_id, op, "MOTION")
         return self._active_pair
 
-    def _match_pair(self, frame: InboundFrame, pair: tuple[int, int]) -> bool:
-        return frame.session_id == pair[0] and frame.operation_id == pair[1] and frame.session_id != 0 and frame.operation_id != 0
+    @staticmethod
+    def _match_pair(frame: InboundFrame, pair: tuple[int, int]) -> bool:
+        return (
+            frame.session_id == pair[0]
+            and frame.operation_id == pair[1]
+            and frame.session_id != 0
+            and frame.operation_id != 0
+        )
 
     async def _motion_ack(self, command: str, pair: tuple[int, int], timeout: float = 0.7) -> None:
         def accept(frame: InboundFrame) -> bool:
@@ -372,12 +498,16 @@ class RobotLinkClient:
                 return False
             self.blackbox.record("ACK_ACCEPT", *pair, detail=frame.kind)
             return True
-        frame = await self._request(command, accept, timeout)
+
+        # generic_errors=False is critical: a stale NACK/ERR must not abort the
+        # current finite operation unless its SID/OP matches the pending pair.
+        frame = await self._request(command, accept, timeout, generic_errors=False)
         if frame.kind != "ACK":
             raise RobotLinkError(frame.raw)
 
     async def _wait_motion_terminal(self, pair: tuple[int, int], motion: str, timeout: float) -> InboundFrame:
         motion = motion.upper()
+
         def terminal(frame: InboundFrame) -> bool:
             if frame.kind not in {"DONE", "ERR"} or not frame.has(motion):
                 return False
@@ -400,12 +530,18 @@ class RobotLinkClient:
             raise RobotLinkError("motion cancelled by STOP/safety/PS2")
         return terminal_task.result()
 
-    async def move_distance(self, forward: bool, distance_mm: int, speed: int, timeout: float | None = None) -> DistanceResult:
+    async def move_distance(
+        self,
+        forward: bool,
+        distance_mm: int,
+        speed: int,
+        timeout: float | None = None,
+    ) -> DistanceResult:
         distance_mm = max(1, min(int(distance_mm), 5000))
-        speed = max(10, min(int(speed), 20))
+        speed = self._clamp_motion_speed(speed)
         timeout = timeout or self.config.motion_timeout_s
         async with self._motion_lock:
-            pair = self._begin_pair()
+            pair = self._begin_pair("MOVE")
             command = f"MOVE,{'FWD' if forward else 'BACK'},{distance_mm},{speed},SID,{pair[0]},OP,{pair[1]}"
             try:
                 await self._motion_ack(command, pair)
@@ -413,12 +549,18 @@ class RobotLinkClient:
                 self.blackbox.record("LEASE_ACQUIRE", *pair, detail="MOVE")
                 frame = await self._wait_motion_terminal(pair, "MOVE", timeout)
                 self._motion_lease = False
-                values = key_values(frame, 2)
+                target = float(_field_after(frame, "TARGET", str(distance_mm)))
+                travel = float(_field_after(frame, "TRAVEL", "0"))
                 if frame.kind == "DONE":
-                    return DistanceResult(DistanceCode.DONE, True, *pair, float(values.get("TARGET", distance_mm)), float(values.get("TRAVEL", 0.0)), frame.fields)
+                    return DistanceResult(DistanceCode.DONE, True, *pair, target, travel, frame.fields)
+
                 code_text = frame.fields[2].upper() if len(frame.fields) > 2 else "LINK_ERROR"
                 code = DistanceCode(code_text) if code_text in DistanceCode._value2member_map_ else DistanceCode.LINK_ERROR
-                return DistanceResult(code, False, *pair, float(distance_mm), float(values.get("TRAVEL", 0.0)), frame.fields)
+                result = DistanceResult(code, False, *pair, target, travel, frame.fields)
+                if not self._ps2_override and not self._stop_in_progress:
+                    with contextlib.suppress(RobotLinkError, RobotLinkTimeout):
+                        await self.stop()
+                return result
             except (RobotLinkError, RobotLinkTimeout):
                 self._motion_lease = False
                 if not self._ps2_override and not self._stop_in_progress:
@@ -428,6 +570,7 @@ class RobotLinkClient:
             finally:
                 self._active_pair = None
                 self._terminal_operation_id = 0
+                self._active_motion_type = ""
 
     async def turn_relative(self, left: bool, angle_deg: int, speed: int, timeout: float = 13.0) -> TurnResult:
         angle_deg = max(1, min(int(angle_deg), 180))
@@ -438,9 +581,9 @@ class RobotLinkClient:
         return await self._turn(f"TURN,ABS,{heading_deg}", speed, timeout)
 
     async def _turn(self, prefix: str, speed: int, timeout: float) -> TurnResult:
-        speed = max(10, min(int(speed), 20))
+        speed = self._clamp_motion_speed(speed)
         async with self._motion_lock:
-            pair = self._begin_pair()
+            pair = self._begin_pair("TURN")
             command = f"{prefix},{speed},SID,{pair[0]},OP,{pair[1]}"
             try:
                 await self._motion_ack(command, pair)
@@ -450,8 +593,14 @@ class RobotLinkClient:
                 self._motion_lease = False
                 if frame.kind != "DONE":
                     raise RobotLinkError(frame.raw)
-                values = key_values(frame, 2)
-                return TurnResult(True, *pair, float(values.get("H", 0.0)), float(values.get("TGT", 0.0)), float(values.get("ERR", 0.0)), frame.fields)
+                return TurnResult(
+                    True,
+                    *pair,
+                    float(_field_after(frame, "H", "0")),
+                    float(_field_after(frame, "TGT", "0")),
+                    float(_field_after(frame, "ERR", "0")),
+                    frame.fields,
+                )
             except (RobotLinkError, RobotLinkTimeout):
                 self._motion_lease = False
                 if not self._ps2_override and not self._stop_in_progress:
@@ -461,11 +610,14 @@ class RobotLinkClient:
             finally:
                 self._active_pair = None
                 self._terminal_operation_id = 0
+                self._active_motion_type = ""
 
     async def _heartbeat_loop(self) -> None:
+        last = 0.0
         while True:
-            await asyncio.sleep(min(0.02, self.config.heartbeat_s))
-            if self._motion_lease:
+            await asyncio.sleep(0.02)
+            now = time.monotonic()
+            if self._motion_lease and now - last >= self.config.heartbeat_s:
                 with contextlib.suppress(RobotLinkError, OSError):
                     await self._send("HB")
-                await asyncio.sleep(max(0.0, self.config.heartbeat_s - 0.02))
+                    last = now
